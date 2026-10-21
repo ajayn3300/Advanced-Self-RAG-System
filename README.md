@@ -1,260 +1,193 @@
-***
+# 🧠 Advanced Self-RAG System
 
-```markdown
-# 🧠 Advanced Self-RAG System with LangGraph & HITL
-
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-orange.svg)](https://github.com/langchain-ai/langgraph)
-[![LangChain](https://img.shields.io/badge/Framework-LangChain-green.svg)](https://python.langchain.com/)
-[![Groq](https://img.shields.io/badge/LLM%20Inference-Groq-purple.svg)](https://groq.com/)
-[![Vector Store](https://img.shields.io/badge/Vector%20Store-FAISS-red.svg)](https://github.com/facebookresearch/faiss)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
-An intelligent, self-reflective, agentic **Self-RAG (Self-Reflective Retrieval-Augmented Generation)** pipeline powered by **LangGraph**, **Groq**, **FAISS**, and **Tavily Web Search**. 
-
-Unlike standard linear RAG pipelines, this system dynamically decides whether external knowledge is necessary, filters out irrelevant or noisy context, verifies hallucination and answer faithfulness, gracefully falls back to web search with query refinement, and features a stateful **Human-in-the-Loop (HITL)** approval mechanism.
+An advanced **Self-Reflective Retrieval-Augmented Generation (Self-RAG)** pipeline built with **LangGraph** and **LangChain**. Instead of blindly retrieving documents for every question, the system *decides* whether retrieval is needed, *judges* the relevance of what it retrieves, *verifies* that its answer is grounded in the context, and can fall back to a **human-approved web search** when the knowledge base has nothing useful.
 
 ---
 
-## 📑 Table of Contents
+## ✨ Features
 
-- [Overview](#-overview)
-- [Key Features](#-key-features)
-- [System Architecture & Flow](#-system-architecture--flow)
-- [Pipeline Execution Breakdown](#-pipeline-execution-breakdown)
-- [Tech Stack & Libraries](#-tech-stack--libraries)
-- [Project Structure](#-project-structure)
-- [Installation & Setup](#-installation--setup)
-- [Environment Variables](#-environment-variables)
-- [Usage Guide](#-usage-guide)
-- [Evaluation & Self-Reflection Metrics](#-evaluation--self-reflection-metrics)
-- [Contributing](#-contributing)
-- [License](#-license)
+- **Adaptive retrieval decision** – an LLM decides whether a question needs external documents or can be answered directly.
+- **Hybrid retrieval** – combines semantic search (FAISS + sentence-transformer embeddings) with keyword search (BM25) using an ensemble retriever.
+- **Document relevance grading** – each retrieved chunk is judged by the LLM and irrelevant chunks are filtered out.
+- **Grounded answer generation** – answers are generated *only* from the relevant context.
+- **Self-verification (hallucination check)** – the generated answer is evaluated as `fully_supported`, `partially_supported`, or `no_supported`, along with an `is_hallucinating` flag.
+- **Query refinement + web search fallback** – if no relevant documents are found, the query is rewritten and searched on the web via Tavily.
+- **Human-in-the-Loop (HITL)** – before any web search, the graph pauses and asks the user for approval (`yes` / `no`).
+- **Stateful execution** – uses LangGraph's `MemorySaver` checkpointer so the graph can be interrupted and resumed.
 
 ---
 
-## 🔍 Overview
-
-Traditional RAG systems blindly retrieve documents for every query and feed them directly to an LLM, leading to several critical failure modes:
-1. **Unnecessary retrieval** for trivial or general queries.
-2. **Context contamination** from low-similarity or irrelevant chunks.
-3. **Hallucinations** when retrieved context is insufficient or ungrounded.
-4. **Knowledge boundaries** when the vector store lacks the required domain data.
-
-This project implements **Self-RAG** using a cyclic **StateGraph** that incorporates self-correction, relevance grading, hallucination detection, autonomous query refinement, and human interaction.
-
----
-
-## ✨ Key Features
-
-- **Dynamic Retrieval Routing:** Evaluates user questions to decide if local document retrieval is required or if parametric LLM knowledge suffices.
-- **Document Relevance Grading:** Automatically grades retrieved vector chunks against the question using structured Pydantic outputs, pruning out false positives.
-- **Self-Reflective Answer Assessment:**
-  - **Support Validation:** Checks if the generated answer is `fully_supported`, `partially_supported`, or `no_supported`.
-  - **Hallucination Detection:** Flagging ungrounded facts using boolean indicators (`is_hallucinating`).
-- **Autonomous Query Refinement:** Rewrites ambiguous user prompts into search-optimized queries before executing external searches.
-- **Web Search Fallback:** Integrates **Tavily Search API** when local vector stores do not contain sufficient information.
-- **Human-in-the-Loop (HITL) Interrupts:** Pauses the execution graph using LangGraph's `interrupt()` and `MemorySaver()` checkpointing to prompt the user before initiating web searches.
-
----
-
-## 🏗 System Architecture & Flow
+## 🏗️ Architecture
 
 ```mermaid
 flowchart TD
-    START([User Query]) --> decide_retrieval{Need Retrieval?}
+    A([START]) --> B[decide_retrieval]
+    B -- "retrieval needed" --> C[retrieve<br/>Hybrid: FAISS + BM25]
+    B -- "no retrieval needed" --> D[generate_direct]
+    D --> Z([END])
 
-    decide_retrieval -- No --> generate_direct[Generate Direct from LLM]
-    decide_retrieval -- Yes --> retrieve[FAISS Vector Search]
+    C --> E[is_relevant<br/>LLM relevance grading]
+    E -- "relevant docs found" --> F[generate_from_context]
+    E -- "no relevant docs" --> G[no_relevant_docs<br/>HITL: ask user]
 
-    retrieve --> is_relevant[Judge Document Relevance]
-    
-    is_relevant -- Relevant Docs Found --> generate_from_context[Generate from Context]
-    is_relevant -- No Relevant Docs --> HITL_prompt[HITL Interrupt: Ask User]
+    F --> H[is_suff<br/>support + hallucination check]
+    H --> Z
 
-    generate_from_context --> is_suff{Hallucination & Support Check}
-    is_suff --> END([Output Final Answer])
-
-    HITL_prompt -- User Rejects (No) --> END
-    HITL_prompt -- User Approves (Yes) --> webSearch[Refine Query & Tavily Web Search]
-    
-    webSearch --> is_relevant
-    generate_direct --> END
+    G -- "user says yes" --> I[webSearch<br/>query refine + Tavily]
+    G -- "user says no" --> Z
+    I --> E
 ```
 
----
+### Node overview
 
-## 🔄 Pipeline Execution Breakdown
-
-The notebook demonstrates an evolutionary step-by-step construction of the graph:
-
-### 1. Document Ingestion & Vector Indexing
-- Documents in `./documents/` are loaded using `UnstructuredLoader` with a `by_title` chunking strategy.
-- Chunks are split using `RecursiveCharacterTextSplitter(chunk_size=900, chunk_overlap=150)`.
-- Normalized vector embeddings are computed using `sentence-transformers/all-MiniLM-L6-v2`.
-- Indexed using **FAISS** for fast similarity retrieval ($k=4$).
-
-### 2. Retrieval Decision Node (`decide_retrieval`)
-Determines if answering requires specific factual context or citations:
-- Returns structured output: `retrievalDecision(decision: bool)`.
-- **False:** Routes directly to `generate_direct`.
-- **True:** Routes to `retrieve`.
-
-### 3. Document Relevance Grader (`is_relevant`)
-Iterates over retrieved documents to ensure alignment with the question:
-- Uses `judgeDocs(is_relevant: bool)` schema to eliminate irrelevant documents.
-- If relevant documents exist, routes to `generate_from_context`.
-- If no documents are relevant, routes to `no_relevant_docs`.
-
-### 4. Hallucination & Sufficiency Check (`is_suff`)
-Supervises the generated context-grounded response:
-- Output Schema:
-  - `answer`: `Literal['fully_supported', 'partially_supported', 'no_supported']`
-  - `is_hallucinating`: `bool`
-
-### 5. Web Search & Query Refinement (`webSearch`)
-If local documents are insufficient:
-- Transforms the query into a high-precision search query using `queryRefiner(refined_query: str)`.
-- Queries Tavily API for top real-time search results.
-- Returns new documents and routes them back into the relevance evaluator.
-
-### 6. Human-in-the-Loop (HITL) Interruption
-- Calls `interrupt("there is no relevant information... Do you want to search on web ? - yes/no")`.
-- Execution halts statefully using `MemorySaver(checkpointer)`.
-- The user can resume the graph using `Command(resume='yes')` or reject external retrieval.
+| Node | Purpose |
+|------|---------|
+| `decide_retrieval` | Structured-output LLM call that returns `True`/`False` on whether external knowledge is needed (defaults to `True` when unsure). |
+| `generate_direct` | Answers from the model's own knowledge when no retrieval is needed. |
+| `retrieve` | Fetches chunks using the hybrid (vector + BM25) ensemble retriever. |
+| `is_relevant` | Grades each retrieved document for relevance and keeps only the useful ones. |
+| `generate_from_context` | Produces an answer using **only** the relevant context. |
+| `is_suff` | Evaluates whether the answer is supported by the context and flags hallucinations. |
+| `no_relevant_docs` | Pauses the graph with `interrupt()` and asks the user whether to search the web. |
+| `webSearch` | Refines the query with the LLM, then fetches the top 3 results from Tavily. |
 
 ---
 
-## 🛠 Tech Stack & Libraries
+## 🛠️ Tech Stack
 
-| Category | Technology | Purpose |
-| :--- | :--- | :--- |
-| **Orchestration** | [LangGraph](https://github.com/langchain-ai/langgraph) | Cyclic graph state management, conditional branching & HITL |
-| **LLM Engine** | [ChatGroq](https://groq.com/) | Ultra-low latency LLM inference (`openai/gpt-oss-20b`) |
-| **Embeddings** | [HuggingFace](https://huggingface.co/sentence-transformers) | `sentence-transformers/all-MiniLM-L6-v2` |
-| **Vector Store** | [FAISS](https://github.com/facebookresearch/faiss) | Dense vector storage and similarity retrieval |
-| **Document Parsing**| [Unstructured](https://unstructured.io/) | Title-based and structure-aware chunk extraction |
-| **Web Search** | [Tavily Search](https://tavily.com/) | Real-time AI-tailored web search queries |
-| **Validation** | [Pydantic v2](https://docs.pydantic.dev/) | Structured LLM output parsing and schema enforcement |
-| **State Persistence**| `MemorySaver` | Graph checkpointing for state restoration across interrupts |
+| Component | Technology |
+|-----------|------------|
+| Orchestration | [LangGraph](https://github.com/langchain-ai/langgraph) |
+| LLM framework | [LangChain](https://github.com/langchain-ai/langchain) |
+| LLM | `openai/gpt-oss-20b` served through [Groq](https://groq.com/) (`ChatGroq`) |
+| Embeddings | `sentence-transformers/all-MiniLM-L6-v2` (Hugging Face) |
+| Vector store | [FAISS](https://github.com/facebookresearch/faiss) |
+| Keyword retriever | BM25 |
+| Web search | [Tavily](https://tavily.com/) |
+| Structured outputs | Pydantic |
+| Document loading | `PyPDFDirectoryLoader` |
 
 ---
 
-## 📂 Project Structure
+## 📁 Project Structure
 
-```bash
+```
 Advanced-Self-RAG-System/
-├── documents/                     # Target knowledge base files (PDF, DOCX, TXT)
-│   └── sample_docs.txt
-├── Advanced RAG pipeline.ipynb   # Complete step-by-step Self-RAG LangGraph notebook
-├── .env.example                  # Environment variables template
-├── requirements.txt              # Project dependencies
-└── README.md                     # Project documentation
+├── Advanced RAG pipeline.ipynb   # Full step-by-step implementation
+├── documents/                    # Place your PDF knowledge-base files here
+├── .env                          # API keys (not committed)
+└── README.md
 ```
+
+> The notebook builds the pipeline incrementally, in six steps: retrieval decision → relevance grading → context generation → answer verification → web search → human-in-the-loop.
 
 ---
 
-## ⚙️ Installation & Setup
+## 🚀 Getting Started
 
-### 1. Clone Repository
+### 1. Clone the repository
+
 ```bash
 git clone https://github.com/ajayn3300/Advanced-Self-RAG-System.git
 cd Advanced-Self-RAG-System
 ```
 
-### 2. Create and Activate Virtual Environment
+### 2. Create a virtual environment
+
 ```bash
-# Using conda or venv
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+source venv/bin/activate      # On Windows: venv\Scripts\activate
 ```
 
-### 3. Install Dependencies
+### 3. Install dependencies
+
 ```bash
-pip install -r requirements.txt
+pip install python-dotenv pydantic pypdf faiss-cpu rank_bm25 sentence-transformers \
+            langchain langchain-classic langchain-community langchain-core \
+            langchain-groq langchain-huggingface langchain-tavily langgraph jupyter
 ```
 
-*If creating your own environment, ensure the following core libraries are installed:*
-```bash
-pip install langgraph langchain langchain-groq langchain-huggingface \
-            langchain-community langchain-unstructured faiss-cpu \
-            pydantic tavily-python python-dotenv sentence-transformers
-```
+### 4. Configure environment variables
 
----
-
-## 🔑 Environment Variables
-
-Create a `.env` file in the root directory:
+Create a `.env` file in the project root:
 
 ```env
-GROQ_API_KEY=your_groq_api_key_here
-TAVILY_API_KEY=your_tavily_api_key_here
+GROQ_API_KEY=your_groq_api_key
+TAVILY_API_KEY=your_tavily_api_key
+# Optional: only needed if you use Hugging Face Inference Endpoint embeddings
+HF_TOKEN=your_huggingface_token
 ```
 
----
+### 5. Add your documents
 
-## 🚀 Usage Guide
+Put your PDF files inside the `documents/` folder. They will be loaded, split into chunks (`chunk_size=1000`, `chunk_overlap=100`), embedded, and indexed automatically.
 
-Open the notebook in Jupyter Notebook or VS Code:
+### 6. Run the notebook
 
 ```bash
 jupyter notebook "Advanced RAG pipeline.ipynb"
 ```
 
-### Running the Graph with Human-in-the-Loop:
+---
+
+## 💡 Usage Example
 
 ```python
-from langgraph.types import Command
+config = {"configurable": {"thread_id": "1"}}
 
-# 1. Initialize Thread Configuration
-config = {"configurable": {"thread_id": "session-001"}}
-
-# 2. Invoke Graph with a query not present in local docs
+# Ask a question
 result = app.invoke(
-    {"question": "Tell me about the financial performance of NexaAI company"},
+    {"question": "Tell me about the financial performance of the company"},
     config=config
 )
 
-# 3. Check for Human-in-the-Loop Interruption
-if result.get('__interrupt__', ''):
-    prompt_message = result.get('__interrupt__')[-1].value
-    print("Agent Prompt:", prompt_message)
-    # Output: "there is no relevant information about the query you asked. Do you want to search on web ? - yes/no"
+# If no relevant documents exist, the graph pauses and asks for permission
+if result.get("__interrupt__"):
+    print(result["__interrupt__"][-1].value)
+    # -> "there is no relevant information about the query you asked.
+    #     Do you want to search on web? - yes/no"
 
-# 4. Resume Graph with User Approval
-resumed_result = app.invoke(
-    Command(resume='yes'),
-    config=config
-)
+    # Resume the graph with the user's decision
+    from langgraph.types import Command
+    result = app.invoke(Command(resume="yes"), config=config)
 
-print("Final Answer:\n", resumed_result["answer"])
+print(result["answer"])
+print("Support level:   ", result.get("is_supporting"))
+print("Hallucinating?:  ", result.get("is_hallucinating"))
 ```
 
 ---
 
-## 📊 Evaluation & Self-Reflection Metrics
+## 🔄 How It Works
 
-The graph state maintains the following self-reflection keys across execution:
+1. **Decide** – The LLM classifies whether the question needs external facts or can be answered from general knowledge.
+2. **Retrieve** – If needed, a hybrid retriever (40% semantic, 60% keyword weighting) pulls the top chunks from the document store.
+3. **Grade** – Every chunk is checked for relevance; only useful ones move forward.
+4. **Generate** – The answer is written strictly from the relevant context.
+5. **Verify** – A supervisor LLM labels the answer as fully, partially, or not supported and flags hallucinations.
+6. **Fallback** – If nothing relevant is found, the user is asked for permission to search the web. On approval, the query is refined, Tavily results are fetched, and they are re-graded before generating the final answer.
 
-| State Key | Type | Description |
-| :--- | :--- | :--- |
-| `need_retrieval` | `bool` | True if question requires external document retrieval |
-| `relevant_docs` | `List[Document]` | Cleaned, evaluated chunks confirmed relevant to question |
-| `refined_query` | `str` | Web-optimized prompt generated before querying Tavily |
-| `is_supporting` | `str` | Degree of context grounding (`fully_supported`, `partially_supported`, `no_supported`) |
-| `is_hallucinating`| `bool` | True if the answer asserts information not derived from context |
-| `web_search` | `bool` | Indicates whether Tavily web search fallback was triggered |
+---
+
+## 🔮 Future Improvements
+
+- Retry / rewrite loop when an answer is `partially_supported` or hallucinated
+- Support for more document types (DOCX, TXT, web pages)
+- Persistent vector store instead of in-memory FAISS
+- Web UI using Streamlit or Gradio
+- Evaluation with RAGAS or similar metrics
+- Source citations in the final answer
 
 ---
 
 ## 🤝 Contributing
 
-Contributions, issues, and feature requests are welcome!
-1. Fork the repository.
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`).
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`).
-4. Push to the branch (`git push origin feature/AmazingFeature`).
-5. Open a Pull Request.
+Contributions, issues, and feature requests are welcome. Feel free to open an issue or submit a pull request.
 
 ---
+
+## 👤 Author
+
+**Ajay** – [@ajayn3300](https://github.com/ajayn3300)
+
+If you found this project useful, consider giving it a ⭐!
